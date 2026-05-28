@@ -1639,7 +1639,13 @@
       }
 
       async function analyzeWithBrowserOcr(file, dataUrl) {
-        if (!canUseBrowserOcr()) return null;
+        if (!canUseBrowserOcr()) {
+          return {
+            ocrUnavailable: true,
+            browserOcrFailed: true,
+            note: "OCR 组件还没加载完成，请刷新后再试",
+          };
+        }
         try {
           setOcrHint("正在浏览器内识别截图，首次加载会慢一些");
           const { data } = await Tesseract.recognize(dataUrl, "eng+chi_sim", {
@@ -1656,7 +1662,7 @@
           });
           const text = data?.text || "";
           const known = analyzeFromKnownReceipts(file.name, text);
-          setOcrHint("浏览器 OCR 已完成，识别结果已填入待确认");
+          setOcrHint(text ? "浏览器 OCR 已完成，识别结果已填入待确认" : "浏览器 OCR 已完成，但未读到文字");
           return {
             ...(known || {}),
             text,
@@ -1671,7 +1677,11 @@
           };
         } catch {
           setOcrHint("浏览器 OCR 加载失败，截图已进入待确认", true);
-          return null;
+          return {
+            ocrUnavailable: true,
+            browserOcrFailed: true,
+            note: "浏览器 OCR 加载失败，请刷新后再上传一次",
+          };
         }
       }
 
@@ -1681,7 +1691,7 @@
         const imageText = await readTextFromImage(file);
         const localOcr = await analyzeWithLocalOcr(file, dataUrl);
         const browserOcr = localOcr?.skippedRemotePage ? await analyzeWithBrowserOcr(file, dataUrl) : null;
-        const bestOcr = localOcr?.ocrAvailable ? localOcr : browserOcr;
+        const bestOcr = localOcr?.ocrAvailable ? localOcr : browserOcr?.ocrAvailable ? browserOcr : null;
         const ocrReady = Boolean(bestOcr?.ocrAvailable);
         const textAmount = parseAmountFromText(imageText);
         const ocrAmount = ocrReady ? Number(bestOcr?.amount) || "" : "";
@@ -1695,9 +1705,11 @@
           type: known?.type || bestOcr?.type || "共同消费",
           splitMode: known?.splitMode || bestOcr?.splitMode || "both",
           confidence: known ? "high" : ocrReady ? bestOcr.confidence || "medium" : textAmount ? "medium" : "low",
-          ocrUnavailable: Boolean(localOcr?.ocrUnavailable && !browserOcr),
-          skippedRemotePage: Boolean(localOcr?.skippedRemotePage && !browserOcr),
-          browserOcr: Boolean(browserOcr),
+          note: browserOcr?.note || localOcr?.note || "",
+          ocrUnavailable: Boolean(localOcr?.ocrUnavailable && !bestOcr),
+          skippedRemotePage: Boolean(localOcr?.skippedRemotePage && !bestOcr && !browserOcr?.browserOcrFailed),
+          browserOcr: Boolean(browserOcr?.ocrAvailable),
+          browserOcrFailed: Boolean(browserOcr?.browserOcrFailed),
           sourceText: ocrReady ? bestOcr?.text || imageText : imageText,
         };
       }
@@ -1759,7 +1771,9 @@
                 splitMode: analysis.splitMode || "both",
                 note:
                   analysis.note ||
-                  (analysis.ocrUnavailable
+                  (analysis.browserOcrFailed
+                    ? "浏览器 OCR 未能完成，请刷新后重试"
+                    : analysis.ocrUnavailable
                     ? analysis.skippedRemotePage
                       ? "线上版暂不连接本机 OCR，请确认后入账"
                       : `未连接本地识别服务，请用 ${OCR_PAGE_URL} 打开本页后再试`
@@ -1772,7 +1786,9 @@
               updateDraftAmounts(liveDraft);
               renderPending();
               notify(
-                analysis.skippedRemotePage
+                analysis.browserOcrFailed
+                  ? "浏览器识别失败，已加入待确认"
+                  : analysis.skippedRemotePage
                   ? "已加入待确认"
                   : analysis.ocrUnavailable
                   ? "本地识别服务未连接"
