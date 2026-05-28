@@ -1186,6 +1186,7 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@6/dist/tesseract.min.js"></script>
     <script>
       const initialEntries = [
         {
@@ -1504,6 +1505,10 @@
         return ["localhost", "127.0.0.1"].includes(location.hostname);
       }
 
+      function canUseBrowserOcr() {
+        return Boolean(window.Tesseract?.recognize);
+      }
+
       function todayIso() {
         const now = new Date();
         const offset = now.getTimezoneOffset() * 60000;
@@ -1533,15 +1538,65 @@
       }
 
       function parseAmountFromText(text) {
-        const normalized = normalizeText(text);
-        const matches = [...normalized.matchAll(/(?:rm|myr)?\s*([0-9]{1,5}(?:[.,][0-9]{1,2})?)/g)]
-          .map((match) => Number(match[1].replace(",", ".")))
-          .filter((value) => value > 0 && value < 10000);
-        return matches.length ? Math.max(...matches) : 0;
+        const candidates = [];
+        String(text || "")
+          .split(/\n+/)
+          .forEach((line) => {
+            const lower = line.toLowerCase();
+            const isFinalTotal = /\b(grand|net|n\.?)?\s*total\b|amount\s*paid|balance\s*due/.test(lower);
+            const isIntermediate = /subtotal|sub\s*total|tax|taxable|service\s*charge|charge@|rounding|summary/.test(lower);
+            const hasMoneyHint = /\brm\b|\bmyr\b|total|amount|paid|grand|balance/.test(lower);
+            const nums = [...line.matchAll(/(?:rm|myr)?\s*([0-9]{1,4}(?:[.,][0-9]{1,2})?)/gi)]
+              .map((match) => Number(match[1].replace(",", ".")))
+              .filter((value) => value > 0 && value < 5000);
+            nums.forEach((value) => {
+              candidates.push({
+                value,
+                score: (isFinalTotal ? 8 : 0) + (hasMoneyHint ? 2 : 0) - (isIntermediate ? 5 : 0),
+              });
+            });
+          });
+        if (!candidates.length) return 0;
+        candidates.sort((a, b) => b.score - a.score || b.value - a.value);
+        return candidates[0].value;
       }
 
-      function analyzeFromKnownReceipts(fileName) {
-        const normalized = normalizeText(fileName);
+      function parseDateFromText(fileName, text) {
+        const nameYmd = fileName.match(/(20\d{2})[-/._ ]?(\d{1,2})[-/._ ]?(\d{1,2})/);
+        if (nameYmd) return `${nameYmd[1]}-${nameYmd[2].padStart(2, "0")}-${nameYmd[3].padStart(2, "0")}`;
+        const dmy = String(text || "").match(/(\d{1,2})[-/](\d{1,2})[-/](20\d{2})/);
+        if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
+        const ymd = String(text || "").match(/(20\d{2})[-/._ ](\d{1,2})[-/._ ](\d{1,2})/);
+        if (ymd) return `${ymd[1]}-${ymd[2].padStart(2, "0")}-${ymd[3].padStart(2, "0")}`;
+        return "";
+      }
+
+      function parseItemFromText(fileName, text) {
+        const known = analyzeFromKnownReceipts(fileName, text);
+        if (known) return known.item;
+        const firstUseful = String(text || "")
+          .split(/\n+/)
+          .map((line) => line.trim())
+          .find((line) => {
+            const ascii = line.replace(/[^\x20-\x7e]/g, "");
+            const letters = (line.match(/[A-Za-z]/g) || []).length;
+            const symbols = (line.match(/[《》“”~#$%^*=|\\[\]{}<>]/g) || []).length;
+            const readableRatio = ascii.length / Math.max(line.length, 1);
+            return (
+              /[A-Za-z]{3,}/.test(line) &&
+              readableRatio > 0.55 &&
+              letters / Math.max(line.length, 1) > 0.35 &&
+              symbols / Math.max(line.length, 1) < 0.22 &&
+              !/\d{4}|receipt|invoice|transaction|subtotal|total|tax|table|cover|tel|floor|preferred|guest|order|thank/i.test(
+                line
+              )
+            );
+          });
+        return firstUseful ? firstUseful.slice(0, 80) : "";
+      }
+
+      function analyzeFromKnownReceipts(fileName, text = "") {
+        const normalized = normalizeText(`${fileName} ${text}`);
         return KNOWN_RECEIPTS.find((receipt) => receipt.match.every((keyword) => normalized.includes(keyword)));
       }
 
@@ -1583,27 +1638,67 @@
         return { ocrUnavailable: true };
       }
 
+      async function analyzeWithBrowserOcr(file, dataUrl) {
+        if (!canUseBrowserOcr()) return null;
+        try {
+          setOcrHint("正在浏览器内识别截图，首次加载会慢一些");
+          const { data } = await Tesseract.recognize(dataUrl, "eng+chi_sim", {
+            workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@6/dist/worker.min.js",
+            corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@6/tesseract-core-simd.wasm.js",
+            langPath: "https://tessdata.projectnaptha.com/4.0.0",
+            gzip: true,
+            logger: (message) => {
+              if (message.status === "recognizing text") {
+                const pct = Math.round((message.progress || 0) * 100);
+                setOcrHint(`正在浏览器内识别截图 ${pct}%`);
+              }
+            },
+          });
+          const text = data?.text || "";
+          const known = analyzeFromKnownReceipts(file.name, text);
+          setOcrHint("浏览器 OCR 已完成，识别结果已填入待确认");
+          return {
+            ...(known || {}),
+            text,
+            date: parseDateFromText(file.name, text),
+            item: known?.item || parseItemFromText(file.name, text),
+            amount: known?.amount || parseAmountFromText(text),
+            type: known?.type || "共同消费",
+            splitMode: known?.splitMode || "both",
+            confidence: known ? "high" : text ? "medium" : "low",
+            ocrAvailable: true,
+            browserOcr: true,
+          };
+        } catch {
+          setOcrHint("浏览器 OCR 加载失败，截图已进入待确认", true);
+          return null;
+        }
+      }
+
       async function analyzeReceipt(file, dataUrl) {
         const guess = guessFromName(file.name);
         const known = analyzeFromKnownReceipts(file.name);
         const imageText = await readTextFromImage(file);
         const localOcr = await analyzeWithLocalOcr(file, dataUrl);
-        const ocrReady = Boolean(localOcr?.ocrAvailable);
-        const textAmount = parseAmountFromText(`${file.name} ${imageText}`);
-        const ocrAmount = ocrReady ? Number(localOcr?.amount) || "" : "";
+        const browserOcr = localOcr?.skippedRemotePage ? await analyzeWithBrowserOcr(file, dataUrl) : null;
+        const bestOcr = localOcr?.ocrAvailable ? localOcr : browserOcr;
+        const ocrReady = Boolean(bestOcr?.ocrAvailable);
+        const textAmount = parseAmountFromText(imageText);
+        const ocrAmount = ocrReady ? Number(bestOcr?.amount) || "" : "";
         return {
           ...guess,
-          ...(ocrReady ? localOcr : {}),
+          ...(ocrReady ? bestOcr : {}),
           ...(known || {}),
-          date: known?.date || localOcr?.date || guess.date,
-          item: known?.item || localOcr?.item || guess.item,
+          date: known?.date || bestOcr?.date || guess.date,
+          item: known?.item || bestOcr?.item || guess.item,
           amount: known?.amount || ocrAmount || textAmount || "",
-          type: known?.type || localOcr?.type || "共同消费",
-          splitMode: known?.splitMode || localOcr?.splitMode || "both",
-          confidence: known ? "high" : ocrReady ? localOcr.confidence || "medium" : textAmount ? "medium" : "low",
-          ocrUnavailable: Boolean(localOcr?.ocrUnavailable),
-          skippedRemotePage: Boolean(localOcr?.skippedRemotePage),
-          sourceText: ocrReady ? localOcr?.text || imageText : imageText,
+          type: known?.type || bestOcr?.type || "共同消费",
+          splitMode: known?.splitMode || bestOcr?.splitMode || "both",
+          confidence: known ? "high" : ocrReady ? bestOcr.confidence || "medium" : textAmount ? "medium" : "low",
+          ocrUnavailable: Boolean(localOcr?.ocrUnavailable && !browserOcr),
+          skippedRemotePage: Boolean(localOcr?.skippedRemotePage && !browserOcr),
+          browserOcr: Boolean(browserOcr),
+          sourceText: ocrReady ? bestOcr?.text || imageText : imageText,
         };
       }
 
@@ -2138,7 +2233,7 @@
       if (location.protocol === "file:") {
         setOcrHint(`建议用 ${OCR_PAGE_URL} 打开本页，自动识别更稳定`, true);
       } else if (!canUseLocalOcr()) {
-        setOcrHint("线上版已发布；截图会进入待确认，本机 OCR 请用本地入口", true);
+        setOcrHint(canUseBrowserOcr() ? "线上版会在浏览器内自动识别截图" : "OCR 组件加载中，上传后会进入待确认");
       } else {
         setOcrHint("本机 OCR 已准备，上传后自动填入识别结果");
       }
