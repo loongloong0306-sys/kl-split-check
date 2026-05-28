@@ -584,6 +584,18 @@
         font-size: 11px;
       }
 
+      .entry-meta .entry-delete {
+        margin-left: auto;
+        border-color: #f3c7bb;
+        color: #9a3412;
+        background: #fffaf8;
+      }
+
+      .entry-meta .entry-delete:hover {
+        border-color: #df9b87;
+        background: #fff3ed;
+      }
+
       .side {
         display: grid;
         gap: 14px;
@@ -1715,7 +1727,7 @@
       }
 
       function shotButtons(entry) {
-        const shotControls = entry.shots.length
+        return entry.shots.length
           ? entry.shots
               .map(
                 (shot) =>
@@ -1725,10 +1737,12 @@
               )
               .join(" ")
           : '<span class="note">聊天确认</span>';
-        const removeControl = ` <button class="shot-button" type="button" data-action="remove-entry" data-entry-id="${escapeAttr(
+      }
+
+      function deleteEntryButton(entry) {
+        return `<button class="shot-button entry-delete" type="button" data-action="remove-entry" data-entry-id="${escapeAttr(
           entry.id
         )}" onclick="removeEntryById(this.dataset.entryId)">删除</button>`;
-        return `${shotControls}${removeControl}`;
       }
 
       function removeEntryById(id) {
@@ -1811,7 +1825,7 @@
                 <td class="money">${entry.cici ? fmt(entry.cici) : "-"}</td>
                 <td class="money">${entry.yifan ? fmt(entry.yifan) : "-"}</td>
                 <td><span class="pill ${entry.type.includes("转账") ? "transfer" : ""}">${escapeHtml(entry.type)}</span></td>
-                <td>${shotButtons(entry)}</td>
+                <td>${shotButtons(entry)} ${deleteEntryButton(entry)}</td>
               </tr>
             `
           )
@@ -1836,6 +1850,7 @@
                   <span class="entry-due">cici ${entry.cici ? fmt(entry.cici) : "-"}</span>
                   <span class="entry-due">yifan ${entry.yifan ? fmt(entry.yifan) : "-"}</span>
                   ${shotButtons(entry)}
+                  ${deleteEntryButton(entry)}
                 </div>
               </article>
             `
