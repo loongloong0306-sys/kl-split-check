@@ -1354,7 +1354,7 @@
           note: "自动识别：你、cici、yifan 三人平分",
         },
         {
-          match: ["screen2space", "screen 2 space"],
+          match: [["screen2space", "screen 2 space", "screen 2space"]],
           item: "Screen 2 Space Design",
           amount: 45,
           splitMode: "both",
@@ -1537,22 +1537,56 @@
           .trim();
       }
 
+      function compactText(value) {
+        return normalizeText(value).replace(/[^a-z0-9]+/g, "");
+      }
+
+      function knownReceiptMatches(receipt, text) {
+        const normalized = normalizeText(text);
+        const compact = compactText(text);
+        return receipt.match.every((rule) => {
+          const options = Array.isArray(rule) ? rule : [rule];
+          return options.some((keyword) => normalized.includes(normalizeText(keyword)) || compact.includes(compactText(keyword)));
+        });
+      }
+
       function parseAmountFromText(text) {
         const candidates = [];
         String(text || "")
           .split(/\n+/)
-          .forEach((line) => {
-            const lower = line.toLowerCase();
-            const isFinalTotal = /\b(grand|net|n\.?)?\s*total\b|amount\s*paid|balance\s*due/.test(lower);
-            const isIntermediate = /subtotal|sub\s*total|tax|taxable|service\s*charge|charge@|rounding|summary/.test(lower);
-            const hasMoneyHint = /\brm\b|\bmyr\b|total|amount|paid|grand|balance/.test(lower);
-            const nums = [...line.matchAll(/(?:rm|myr)?\s*([0-9]{1,4}(?:[.,][0-9]{1,2})?)/gi)]
+          .forEach((rawLine, index) => {
+            const raw = String(rawLine || "").replace(/[，]/g, ".");
+            const line = raw.replace(/([0-9])[Oo]/g, (_, digit) => `${digit}0`).replace(/[Oo]([0-9])/g, (_, digit) => `0${digit}`);
+            const lower = raw.toLowerCase();
+            const isFinalTotal =
+              /\b(grand|net|final|order)?\s*total\b|total\s*(paid|amount|payment)|amount\s*(paid|due)|balance\s*due|paid\s*amount/.test(
+                lower
+              );
+            const isIntermediate = /subtotal|sub\s*total|tax|taxable|sst|service\s*charge|charge@|rounding|discount|summary|change/.test(
+              lower
+            );
+            const isReference = /invoice|receipt|ref|reference|transaction|terminal|auth|approval|card|visa|master|order\s*id|merchant\s*id|tel|phone|time|date/.test(
+              lower
+            );
+            const hasMoneyHint = /\brm\b|\bmyr\b|total|amount|paid|grand|balance|payment/.test(lower);
+            const moneyMatches = [
+              ...line.matchAll(/(?:rm|myr)\s*([0-9]{1,5}(?:[.,]\d{1,2})?)/gi),
+              ...line.matchAll(/([0-9]{1,5}[.,]\d{2})\s*(?:rm|myr)?/gi),
+            ];
+            const nums = moneyMatches
               .map((match) => Number(match[1].replace(",", ".")))
-              .filter((value) => value > 0 && value < 5000);
+              .filter((value) => value > 0 && value < 5000 && !Number.isNaN(value));
             nums.forEach((value) => {
+              const hasDecimal = /\d+[.,]\d{1,2}/.test(line);
               candidates.push({
                 value,
-                score: (isFinalTotal ? 8 : 0) + (hasMoneyHint ? 2 : 0) - (isIntermediate ? 5 : 0),
+                score:
+                  (isFinalTotal ? 14 : 0) +
+                  (hasMoneyHint ? 5 : 0) +
+                  (hasDecimal ? 3 : 0) -
+                  (isIntermediate ? 9 : 0) -
+                  (isReference ? 8 : 0) -
+                  index * 0.03,
               });
             });
           });
@@ -1568,36 +1602,123 @@
         if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
         const ymd = String(text || "").match(/(20\d{2})[-/._ ](\d{1,2})[-/._ ](\d{1,2})/);
         if (ymd) return `${ymd[1]}-${ymd[2].padStart(2, "0")}-${ymd[3].padStart(2, "0")}`;
+        const monthNames = {
+          jan: "01",
+          feb: "02",
+          mar: "03",
+          apr: "04",
+          may: "05",
+          jun: "06",
+          jul: "07",
+          aug: "08",
+          sep: "09",
+          oct: "10",
+          nov: "11",
+          dec: "12",
+        };
+        const dMonthY = String(text || "").match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\s*,?\s*(20\d{2})\b/);
+        if (dMonthY) {
+          const month = monthNames[dMonthY[2].slice(0, 3).toLowerCase()];
+          if (month) return `${dMonthY[3]}-${month}-${dMonthY[1].padStart(2, "0")}`;
+        }
+        const monthDY = String(text || "").match(/\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s*(20\d{2})\b/);
+        if (monthDY) {
+          const month = monthNames[monthDY[1].slice(0, 3).toLowerCase()];
+          if (month) return `${monthDY[3]}-${month}-${monthDY[2].padStart(2, "0")}`;
+        }
         return "";
       }
 
       function parseItemFromText(fileName, text) {
         const known = analyzeFromKnownReceipts(fileName, text);
         if (known) return known.item;
-        const firstUseful = String(text || "")
+        const usefulLines = String(text || "")
           .split(/\n+/)
           .map((line) => line.trim())
-          .find((line) => {
+          .filter(Boolean)
+          .map((line, index) => {
             const ascii = line.replace(/[^\x20-\x7e]/g, "");
             const letters = (line.match(/[A-Za-z]/g) || []).length;
             const symbols = (line.match(/[《》“”~#$%^*=|\\[\]{}<>]/g) || []).length;
             const readableRatio = ascii.length / Math.max(line.length, 1);
+            const lower = line.toLowerCase();
+            const badLine = /\d{4}|receipt|invoice|transaction|subtotal|total|tax|table|cover|tel|floor|preferred|guest|order|thank|payment|successful|ref|reference|visa|master|card|merchant|terminal|auth|approval|date|time/i.test(
+              line
+            );
+            const businessHint = /restaurant|cafe|coffee|bakery|baguette|tgv|grab|bus|online|ticket|maisei|ippudo|bagels|screen|space|klcc|suria|studio/.test(
+              lower
+            );
+            return {
+              line,
+              score:
+                (/[A-Za-z]{3,}/.test(line) ? 3 : 0) +
+                (businessHint ? 5 : 0) +
+                Math.min(letters / Math.max(line.length, 1), 0.8) * 4 -
+                (badLine ? 7 : 0) -
+                symbols / Math.max(line.length, 1) * 5 -
+                index * 0.08,
+              readableRatio,
+              letters,
+              symbols,
+            };
+          })
+          .filter(({ line, readableRatio, letters, symbols, score }) => {
             return (
-              /[A-Za-z]{3,}/.test(line) &&
+              score > 1 &&
               readableRatio > 0.55 &&
               letters / Math.max(line.length, 1) > 0.35 &&
-              symbols / Math.max(line.length, 1) < 0.22 &&
-              !/\d{4}|receipt|invoice|transaction|subtotal|total|tax|table|cover|tel|floor|preferred|guest|order|thank/i.test(
-                line
-              )
+              symbols / Math.max(line.length, 1) < 0.22
             );
           });
-        return firstUseful ? firstUseful.slice(0, 80) : "";
+        usefulLines.sort((a, b) => b.score - a.score);
+        return usefulLines[0]?.line.slice(0, 80) || "";
       }
 
       function analyzeFromKnownReceipts(fileName, text = "") {
         const normalized = normalizeText(`${fileName} ${text}`);
-        return KNOWN_RECEIPTS.find((receipt) => receipt.match.every((keyword) => normalized.includes(keyword)));
+        return KNOWN_RECEIPTS.find((receipt) => knownReceiptMatches(receipt, normalized));
+      }
+
+      function loadImage(dataUrl) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = dataUrl;
+        });
+      }
+
+      async function enhanceImageForOcr(dataUrl) {
+        try {
+          const img = await loadImage(dataUrl);
+          const sourceWidth = img.naturalWidth || img.width;
+          const sourceHeight = img.naturalHeight || img.height;
+          const targetWidth = Math.min(Math.max(sourceWidth * 1.6, sourceWidth), 2200);
+          const scale = targetWidth / sourceWidth;
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(sourceWidth * scale);
+          canvas.height = Math.round(sourceHeight * scale);
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const data = imageData.data;
+          for (let i = 0; i < data.length; i += 4) {
+            const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+            let value = (gray - 128) * 1.65 + 138;
+            if (value > 242) value = 255;
+            if (value < 70) value = 0;
+            value = Math.max(0, Math.min(255, value));
+            data[i] = value;
+            data[i + 1] = value;
+            data[i + 2] = value;
+          }
+          ctx.putImageData(imageData, 0, 0);
+          return canvas.toDataURL("image/png");
+        } catch {
+          return dataUrl;
+        }
       }
 
       async function readTextFromImage(file) {
@@ -1647,20 +1768,29 @@
           };
         }
         try {
-          setOcrHint("正在浏览器内识别截图，首次加载会慢一些");
-          const { data } = await Tesseract.recognize(dataUrl, "eng+chi_sim", {
-            workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@6/dist/worker.min.js",
-            corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@6/tesseract-core-simd.wasm.js",
-            langPath: "https://tessdata.projectnaptha.com/4.0.0",
-            gzip: true,
-            logger: (message) => {
-              if (message.status === "recognizing text") {
-                const pct = Math.round((message.progress || 0) * 100);
-                setOcrHint(`正在浏览器内识别截图 ${pct}%`);
-              }
-            },
-          });
-          const text = data?.text || "";
+          setOcrHint("正在增强图片并识别截图，首次加载会慢一些");
+          const enhancedDataUrl = await enhanceImageForOcr(dataUrl);
+          const recognizeOnce = async (image, label) => {
+            const { data } = await Tesseract.recognize(image, "eng+chi_sim", {
+              workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@6/dist/worker.min.js",
+              corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@6/tesseract-core-simd.wasm.js",
+              langPath: "https://tessdata.projectnaptha.com/4.0.0",
+              gzip: true,
+              tessedit_pageseg_mode: "11",
+              preserve_interword_spaces: "1",
+              logger: (message) => {
+                if (message.status === "recognizing text") {
+                  const pct = Math.round((message.progress || 0) * 100);
+                  setOcrHint(`${label}识别中 ${pct}%`);
+                }
+              },
+            });
+            return data?.text || "";
+          };
+          const enhancedText = await recognizeOnce(enhancedDataUrl, "增强图");
+          const shouldRetryOriginal = enhancedText.replace(/\s/g, "").length < 18 || !parseAmountFromText(enhancedText);
+          const originalText = shouldRetryOriginal ? await recognizeOnce(dataUrl, "原图") : "";
+          const text = `${enhancedText}\n${originalText}`.trim();
           const known = analyzeFromKnownReceipts(file.name, text);
           setOcrHint(text ? "浏览器 OCR 已完成，识别结果已填入待确认" : "浏览器 OCR 已完成，但未读到文字");
           return {
