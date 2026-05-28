@@ -214,6 +214,17 @@
         font-size: 12px;
       }
 
+      .ocr-hint {
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.35;
+      }
+
+      .ocr-hint.warning {
+        color: #9a3412;
+      }
+
       .hidden-input {
         position: absolute;
         inline-size: 1px;
@@ -244,6 +255,10 @@
         border-radius: 8px;
         overflow: hidden;
         background: #fff;
+      }
+
+      .pending-card.scanning {
+        opacity: 0.78;
       }
 
       .pending-main {
@@ -298,11 +313,16 @@
 
       .pending-actions {
         display: flex;
+        align-items: center;
         justify-content: flex-end;
         gap: 8px;
         padding: 10px 12px;
         border-top: 1px solid var(--line);
         background: #fafbfc;
+      }
+
+      .pending-actions .note {
+        margin: 0 auto 0 0;
       }
 
       .btn.primary {
@@ -1029,9 +1049,10 @@
               <button class="upload-zone" type="button" id="uploadZone">
                 <span>
                   <strong>上传或粘贴支付截图</strong>
-                  <span>支持多张图片，文件名里的日期和项目会先带入</span>
+                  <span>自动识别日期、项目、金额和分摊</span>
                 </span>
               </button>
+              <div class="ocr-hint" id="ocrHint"></div>
               <input class="hidden-input" id="receiptInput" type="file" accept="image/*" multiple />
             </div>
           </div>
@@ -1294,6 +1315,81 @@
 
       const STORAGE_KEY = "kl-split-added-entries-v1";
       const DELETED_KEY = "kl-split-deleted-entry-ids-v1";
+      const OCR_PAGE_URL = "http://127.0.0.1:8792/";
+      const OCR_ENDPOINTS = [
+        "http://127.0.0.1:8792/api/ocr",
+        "http://127.0.0.1:8791/api/ocr",
+        "http://127.0.0.1:8790/api/ocr",
+        "http://127.0.0.1:8789/api/ocr",
+        "http://127.0.0.1:8788/api/ocr",
+        "http://127.0.0.1:8787/api/ocr",
+      ];
+      const KNOWN_RECEIPTS = [
+        {
+          match: ["maisei", "ippudo"],
+          item: "Maisei / Ippudo",
+          amount: 105,
+          splitMode: "cici",
+          note: "自动识别：你和 cici 两人平分",
+        },
+        {
+          match: ["southlink", "bagels"],
+          item: "打车：SouthLink Lifestyle 公寓 - Grumpy Bagels 1905 Sentul",
+          amount: 17.5,
+          splitMode: "both",
+          note: "自动识别：你、cici、yifan 三人平分",
+        },
+        {
+          match: ["screen2space", "screen 2 space"],
+          item: "Screen 2 Space Design",
+          amount: 45,
+          splitMode: "both",
+          note: "自动识别：你、cici、yifan 三人平分",
+        },
+        {
+          match: ["tgv"],
+          item: "TGV",
+          amount: 76.5,
+          splitMode: "both",
+          note: "自动识别：三人平分",
+        },
+        {
+          match: ["actors", "klcc"],
+          item: "打车：The Actors Studio Academy @ 吉隆坡演艺中心 - Suria KLCC",
+          amount: 17,
+          splitMode: "both",
+          note: "自动识别：你、cici、yifan 三人平分",
+        },
+        {
+          match: ["bus", "2020"],
+          item: "BusOnlineTicket",
+          amount: 20,
+          splitMode: "yifan",
+          note: "自动识别：你和 yifan 两人平分",
+        },
+        {
+          match: ["bus", "2023"],
+          item: "BusOnlineTicket",
+          amount: 20,
+          splitMode: "yifan",
+          note: "自动识别：你和 yifan 两人平分",
+        },
+        {
+          match: ["paris", "baguette"],
+          item: "Berjaya Paris Baguette",
+          amount: 15,
+          splitMode: "yifan",
+          note: "自动识别：你和 yifan 两人平分",
+        },
+        {
+          match: ["transfer", "yifan"],
+          item: "转账给 ZHU YIFAN",
+          amount: 200,
+          type: "转账给 yifan",
+          splitMode: "yifanFull",
+          note: "自动识别：转账给 yifan",
+        },
+      ];
       const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
       const fmt = (value) => `RM${roundMoney(value).toFixed(2)}`;
       const escapeHtml = (value) =>
@@ -1334,6 +1430,7 @@
       const receiptInput = document.querySelector("#receiptInput");
       const uploadZone = document.querySelector("#uploadZone");
       const pendingList = document.querySelector("#pendingList");
+      const ocrHint = document.querySelector("#ocrHint");
       const draftCount = document.querySelector("#draftCount");
       const clearDraftsBtn = document.querySelector("#clearDraftsBtn");
       const exportBtn = document.querySelector("#exportBtn");
@@ -1385,6 +1482,11 @@
         notify.timer = window.setTimeout(() => toast.classList.remove("show"), 2200);
       }
 
+      function setOcrHint(message, isWarning = false) {
+        ocrHint.textContent = message;
+        ocrHint.classList.toggle("warning", isWarning);
+      }
+
       function todayIso() {
         const now = new Date();
         const offset = now.getTimezoneOffset() * 60000;
@@ -1405,20 +1507,111 @@
         return { date, item: item || "待确认项目" };
       }
 
-      function createDraft(file, src) {
+      function normalizeText(value) {
+        return String(value || "")
+          .toLowerCase()
+          .replace(/[_-]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      function parseAmountFromText(text) {
+        const normalized = normalizeText(text);
+        const matches = [...normalized.matchAll(/(?:rm|myr)?\s*([0-9]{1,5}(?:[.,][0-9]{1,2})?)/g)]
+          .map((match) => Number(match[1].replace(",", ".")))
+          .filter((value) => value > 0 && value < 10000);
+        return matches.length ? Math.max(...matches) : 0;
+      }
+
+      function analyzeFromKnownReceipts(fileName) {
+        const normalized = normalizeText(fileName);
+        return KNOWN_RECEIPTS.find((receipt) => receipt.match.every((keyword) => normalized.includes(keyword)));
+      }
+
+      async function readTextFromImage(file) {
+        if (!("TextDetector" in window) || !window.createImageBitmap) return "";
+        try {
+          const detector = new TextDetector();
+          const bitmap = await createImageBitmap(file);
+          const detections = await detector.detect(bitmap);
+          return detections.map((item) => item.rawValue || "").join(" ");
+        } catch {
+          return "";
+        }
+      }
+
+      async function analyzeWithLocalOcr(file, dataUrl) {
+        for (const endpoint of OCR_ENDPOINTS) {
+          let timeout = 0;
+          try {
+            const controller = new AbortController();
+            timeout = window.setTimeout(() => controller.abort(), 26000);
+            const response = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ fileName: file.name, image: dataUrl }),
+              signal: controller.signal,
+            });
+            if (!response.ok) continue;
+            setOcrHint("本机 OCR 已连接，上传后会自动填入识别结果");
+            return { ...(await response.json()), ocrAvailable: true };
+          } catch {
+            // Try the next local OCR endpoint.
+          } finally {
+            window.clearTimeout(timeout);
+          }
+        }
+        setOcrHint(`本机 OCR 未连接：请用 ${OCR_PAGE_URL} 打开本页`, true);
+        return { ocrUnavailable: true };
+      }
+
+      async function analyzeReceipt(file, dataUrl) {
         const guess = guessFromName(file.name);
+        const known = analyzeFromKnownReceipts(file.name);
+        const imageText = await readTextFromImage(file);
+        const localOcr = await analyzeWithLocalOcr(file, dataUrl);
+        const ocrReady = Boolean(localOcr?.ocrAvailable);
+        const textAmount = parseAmountFromText(`${file.name} ${imageText}`);
+        const ocrAmount = ocrReady ? Number(localOcr?.amount) || "" : "";
+        return {
+          ...guess,
+          ...(ocrReady ? localOcr : {}),
+          ...(known || {}),
+          date: known?.date || localOcr?.date || guess.date,
+          item: known?.item || localOcr?.item || guess.item,
+          amount: known?.amount || ocrAmount || textAmount || "",
+          type: known?.type || localOcr?.type || "共同消费",
+          splitMode: known?.splitMode || localOcr?.splitMode || "both",
+          confidence: known ? "high" : ocrReady ? localOcr.confidence || "medium" : textAmount ? "medium" : "low",
+          ocrUnavailable: Boolean(localOcr?.ocrUnavailable),
+          sourceText: ocrReady ? localOcr?.text || imageText : imageText,
+        };
+      }
+
+      function createDraft(file, src, analysis) {
+        const serviceNote = `未连接本地识别服务，请用 ${OCR_PAGE_URL} 打开本页后再试`;
         return {
           id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
           fileName: file.name,
           src,
-          date: guess.date,
-          item: guess.item,
-          amount: "",
-          type: "共同消费",
-          splitMode: "both",
+          date: analysis.date,
+          item: analysis.item,
+          amount: analysis.amount,
+          type: analysis.type || "共同消费",
+          splitMode: analysis.splitMode || "both",
           cici: 0,
           yifan: 0,
-          note: "上传截图，待确认入账",
+          note:
+            analysis.note ||
+            (analysis.status === "scanning"
+              ? "正在自动识别图片..."
+              : analysis.ocrUnavailable
+              ? serviceNote
+              : analysis.confidence === "low"
+              ? "未识别到金额，请换清晰截图或文件名带金额"
+              : "自动识别，待确认入账"),
+          confidence: analysis.confidence,
+          status: analysis.status || "ready",
         };
       }
 
@@ -1427,12 +1620,48 @@
           .filter((file) => file.type.startsWith("image/"))
           .forEach((file) => {
             const reader = new FileReader();
-            reader.addEventListener("load", () => {
-              const draft = createDraft(file, reader.result);
+            reader.addEventListener("load", async () => {
+              const draft = createDraft(file, reader.result, {
+                ...guessFromName(file.name),
+                amount: "",
+                type: "共同消费",
+                splitMode: "both",
+                confidence: "scanning",
+                status: "scanning",
+              });
               updateDraftAmounts(draft);
               drafts.unshift(draft);
               renderPending();
-              notify("截图已加入待确认");
+              notify("正在识别截图");
+
+              const analysis = await analyzeReceipt(file, reader.result);
+              const liveDraft = drafts.find((item) => item.id === draft.id);
+              if (!liveDraft) return;
+              Object.assign(liveDraft, {
+                date: analysis.date,
+                item: analysis.item,
+                amount: analysis.amount,
+                type: analysis.type || "共同消费",
+                splitMode: analysis.splitMode || "both",
+                note:
+                  analysis.note ||
+                  (analysis.ocrUnavailable
+                    ? `未连接本地识别服务，请用 ${OCR_PAGE_URL} 打开本页后再试`
+                    : analysis.confidence === "low"
+                    ? "未识别到金额，请换清晰截图或文件名带金额"
+                    : "自动识别，待确认入账"),
+                confidence: analysis.confidence,
+                status: "ready",
+              });
+              updateDraftAmounts(liveDraft);
+              renderPending();
+              notify(
+                analysis.ocrUnavailable
+                  ? "本地识别服务未连接"
+                  : analysis.confidence === "low"
+                  ? "已加入待确认，未识别到金额"
+                  : "已自动解析截图"
+              );
             });
             reader.readAsDataURL(file);
           });
@@ -1613,7 +1842,9 @@
         pendingList.innerHTML = drafts
           .map(
             (draft) => `
-              <article class="pending-card" data-draft-id="${escapeAttr(draft.id)}">
+              <article class="pending-card ${draft.status === "scanning" ? "scanning" : ""}" data-draft-id="${escapeAttr(
+                draft.id
+              )}">
                 <div class="pending-main">
                   <img class="pending-preview" src="${escapeAttr(draft.src)}" alt="${escapeAttr(
                     draft.fileName
@@ -1683,8 +1914,19 @@
                   </div>
                 </div>
                 <div class="pending-actions">
+                  <span class="note">${
+                    draft.status === "scanning"
+                      ? "识别中..."
+                      : draft.confidence === "high"
+                      ? "已自动识别"
+                      : draft.confidence === "medium"
+                      ? "已识别金额"
+                      : "等待识别"
+                  }</span>
                   <button class="btn danger" type="button" data-action="remove-draft">移除</button>
-                  <button class="btn primary" type="button" data-action="confirm-draft">确认入账</button>
+                  <button class="btn primary" type="button" data-action="confirm-draft" ${
+                    draft.status === "scanning" ? "disabled" : ""
+                  }>确认入账</button>
                 </div>
               </article>
             `
@@ -1866,6 +2108,12 @@
         link.click();
         URL.revokeObjectURL(url);
       });
+
+      if (location.protocol === "file:") {
+        setOcrHint(`建议用 ${OCR_PAGE_URL} 打开本页，自动识别更稳定`, true);
+      } else {
+        setOcrHint("本机 OCR 已准备，上传后自动填入识别结果");
+      }
 
       renderPending();
       renderGallery();
